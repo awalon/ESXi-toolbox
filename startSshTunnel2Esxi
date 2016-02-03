@@ -1,0 +1,113 @@
+#! /bin/sh
+
+# settings -- start
+SSH_USR=root;                      # ssh account on your ESXi host
+SSH_KEY=/home/awalon/.ssh/id_esxi; # ssh key to access you ESXi via ssh
+SSH_SRC=192.168.103.88;   # unused, private IP address (withon different/unused subnet)
+SSH_TGT=192.168.100.111;  # private IP of your ESXi host
+SSH_URL=esxi.example.com; # public DNS/IP of your ESXi host
+SSH_PRT=22902;            # port redirected on your router to port 22 of your ESXi host 
+SSH_LOGFILE=/tmp/`basename $0`_$$.log;
+# settings -- end
+
+# Allows remote acces from VMware Workstation to your ESXi host via SSH tunnel
+# Steps:
+# 1) Free local ports already used by VMware Workstation ...
+#    a) shutdown "authdlauncher"
+#    b) shutdown "hostd"
+# 2) Close previously established SSH tunnels
+# 3) Add configured IP address to your local interface (lo)
+#    (local endpoint of SSH tunnel)
+# 4) Start SSH tunnel to remote ESXi host
+# 5) Restart local VMware Worstation services
+#    (after tunnel was established and blocks the ports on the additional IP on "lo")
+#
+# Note: Tested on Debian
+
+# Hints:
+# * NO MORE: define virtual interface (client)
+#   vi "/etc/network/interfaces"
+#   ----------------------------
+#   auto lo:0
+#   iface lo:0 inet static
+#      address 192.168.103.88
+#      netmask 255.255.255.255
+#      network 192.168.103.88
+#   -> now done with "ip add" command within this script, based on SSH_SRC
+# * auth via ssh key (on your ESXi server)
+#   # modifiy authorized_keys on your ESXi host to allow port forwarding, only with the given key
+#   vi "/etc/ssh/keys-root/authorized_keys"
+#   --- content start (added this at the end of your file)  -----
+#   command="while :;do date;sleep 10;done" ssh-dss <key> <user>
+#   --- content end ---------------------------------------------
+
+
+# import vmware functions
+ETCDIR=/etc/vmware
+. $ETCDIR/bootstrap
+
+libdir="$LIBDIR"/vmware
+. "$libdir"/scripts/util.sh
+
+vmware_stop_hostd() {
+  local hostdpid=`pidof vmware-hostd`
+   if [ -n "$hostdpid" ]; then
+      vmware_synchrone_kill $hostdpid "TERM"
+   fi
+}
+
+vmware_stop_authdlauncher() {
+   local launcherpid=`pidof vmware-authdlauncher`
+   if [ -n "$launcherpid" ]; then
+      vmware_synchrone_kill $launcherpid "TERM"
+   fi
+}
+
+vmware_start_authdlauncher() {
+   vmware_bg_exec "`vmware_product_name` Authentication Daemon" \
+      "$SBINDIR/vmware-authdlauncher"
+}
+
+tunnel_stop_ssh() {
+   local ssh_pid=`pgrep -f "ssh.*-L ${SSH_SRC}:443:${SSH_TGT}:443"`;
+   if [ -n "$ssh_pid" ]; then
+      vmware_synchrone_kill $ssh_pid "TERM"
+   fi
+}
+
+echo "* stop vmware service: vmware-authdlauncher";
+#service vmware stop
+vmware_stop_authdlauncher;
+
+echo "* stop vmware service: vmware-hostd";
+vmware_stop_hostd;
+
+echo "* stop old ssh tunnel(s)";
+tunnel_stop_ssh;
+sleep 2;
+
+echo "* add virtual IP address: ${SSH_SRC}";
+IP_ADD=`ip addr add ${SSH_SRC}/32 dev lo 2>&1 >/dev/null`;
+
+echo "* start ssh tunnel: ${SSH_USR}@${SSH_TGT} via ${SSH_URL}:${SSH_PRT}";
+nohup ssh -T -N -n -C -o "StrictHostKeyChecking=no" -o PubkeyAcceptedKeyTypes=ssh-dss -l ${SSH_USR} -i "${SSH_KEY}" -L ${SSH_SRC}:443:${SSH_TGT}:443 -L ${SSH_SRC}:902:${SSH_TGT}:902 -L ${SSH_SRC}:903:${SSH_TGT}:903 -p ${SSH_PRT} ${SSH_URL} 2>&1 > ${SSH_LOGFILE} &
+# Alternative ssh command:
+# If the tunnel cannot be establishedt, try next line instead
+#nohup ssh -T -N -n -C -o "StrictHostKeyChecking=no" -l ${SSH_USR} -i "${SSH_KEY}" -L ${SSH_SRC}:443:${SSH_TGT}:443 -L ${SSH_SRC}:902:${SSH_TGT}:902 -L ${SSH_SRC}:903:${SSH_TGT}:903 -p ${SSH_PRT} ${SSH_URL} 2>&1 > ${SSH_LOGFILE} &
+sleep 1;
+tail -n 20 ${SSH_LOGFILE};
+echo "  - returned $?";
+echo "  - ssh logfile: ${SSH_LOGFILE}";
+echo "  - ssh pid: `pgrep -f "ssh.*-L ${SSH_SRC}:443:${SSH_TGT}:443"`";
+
+sleep 1;
+echo "* listen on...";
+netstat -tulpn 2>&1|egrep "${SSH_SRC}.*:(443|902|903)\b"
+
+echo "* restart vmware service: vmware-authdlauncher";
+vmware_start_authdlauncher;
+
+echo "###############################################################"
+echo "# now you can connect to your remote ESXi with: ${SSH_USR}"
+echo "###############################################################"
+#service vmware start
